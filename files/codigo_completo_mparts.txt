@@ -1,0 +1,835 @@
+CÓDIGO FUENTE - TIENDA VIRTUAL M-PARTS (PHP + MySQL)
+============================================================
+
+############################################################
+# ARCHIVO: config.example.php
+# Configuración, conexión PDO a MySQL y funciones auxiliares (sin datos reales)
+############################################################
+<?php
+// ===== CONFIGURACIÓN (ajusta estos datos a tu XAMPP) =====
+const DB_HOST = 'localhost';
+const DB_NAME = 'm_parts';       // nombre de tu base de datos en phpMyAdmin
+const DB_USER = 'root';
+const DB_PASS = '';              // XAMPP por defecto no tiene contraseña
+const WHATSAPP = '57XXXXXXXXXX'; // <- número con indicativo (57 = Colombia)
+// Unifica el error de digitación "RESPUESTOS" -> "REPUESTOS" sin tocar tus datos
+const CAT_SQL = "REPLACE(categoria,'RESPUESTOS','REPUESTOS')";
+
+function db(): PDO {
+    static $pdo = null;
+    if (!$pdo) {
+        $pdo = new PDO('mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4', DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+    }
+    return $pdo;
+}
+function h($s): string { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+function cop($n): string { return '$' . number_format((float)$n, 0, ',', '.'); }
+function nombre($s): string { return mb_convert_case(mb_strtolower($s), MB_CASE_TITLE); }
+function cat_label($c): string {
+    $t = mb_convert_case(mb_strtolower($c), MB_CASE_TITLE);
+    return str_replace(['Klr', 'Dr ', 'V-strom'], ['KLR', 'DR ', 'V-Strom'], $t);
+}
+function cat_icon($c): string {
+    $c = strtoupper($c);
+    foreach (['USADOS' => '♻️', 'ACCESORIOS' => '🧰', 'LIQUIDOS' => '🛢️', 'MORRALES' => '🎒', 'STICKERS' => '✨'] as $k => $i)
+        if (str_contains($c, $k)) return $i;
+    return '🏍️';
+}
+function stock_badge($n): array {
+    if ($n <= 0) return ['Agotado', 'out'];
+    if ($n <= 5) return ['Últimas unidades', 'low'];
+    return ['Disponible', 'ok'];
+}
+function url(array $o = []): string {
+    $p = array_filter(array_merge($_GET, $o), fn($v) => $v !== '' && $v !== null);
+    return 'index.php' . ($p ? '?' . http_build_query($p) : '');
+}
+
+// ===== REDES SOCIALES (deja '' para ocultar una) =====
+const SOCIAL = [
+    'Instagram' => 'https://instagram.com/tu_cuenta',
+    'Facebook'  => 'https://facebook.com/tu_pagina',
+    'TikTok'    => 'https://tiktok.com/@tu_cuenta',
+    'YouTube'   => '',
+];
+const CONTACTO = ['Ciudad' => 'Cúcuta, Colombia', 'Horario' => 'Lunes a sábado · 8:00 a.m. – 6:00 p.m.', 'Correo' => 'contacto@mparts.com'];
+
+// ===== ACCESO AL PANEL DE ADMINISTRADOR (cámbialo) =====
+const ADMIN_USER = 'admin';
+const ADMIN_PASS = 'cambia_esto';
+
+if (session_status() === PHP_SESSION_NONE) session_start();
+function is_admin(): bool { return !empty($_SESSION['admin']); }
+function require_admin(): void { if (!is_admin()) { header('Location: login.php'); exit; } }
+function csrf(): string { return $_SESSION['csrf'] ??= bin2hex(random_bytes(16)); }
+function csrf_field(): string { return '<input type="hidden" name="csrf" value="' . csrf() . '">'; }
+function check_csrf(): void {
+    if (!hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'] ?? '')) { http_response_code(419); exit('Sesión expirada. Recarga la página e inténtalo de nuevo.'); }
+}
+function flash(string $m, string $t = 'ok'): void { $_SESSION['flash'] = [$m, $t]; }
+function next_id(PDO $pdo, string $t, string $pk): int { return (int)$pdo->query("SELECT COALESCE(MAX(`$pk`),0)+1 FROM `$t`")->fetchColumn(); }
+
+
+############################################################
+# ARCHIVO: includes/fotos.php
+# Manejo de fotos de productos (buscar, subir, borrar)
+############################################################
+<?php
+// Fotos de productos: archivo assets/img/productos/<CODIGO>.jpg|png|webp  (ej. A001.jpg)
+const FOTO_EXT = ['jpg', 'jpeg', 'png', 'webp', 'JPG', 'JPEG', 'PNG', 'WEBP'];
+function foto_dir(): string { return __DIR__ . '/../assets/img/productos/'; }
+function foto_codigo(string $c): string { return preg_replace('/[^A-Za-z0-9_-]/', '', $c); }
+
+// Devuelve la ruta relativa a la raíz del sitio, o null si el producto no tiene foto.
+function foto(string $codigo): ?string {
+    $c = foto_codigo($codigo); if ($c === '') return null;
+    foreach (FOTO_EXT as $e) {
+        $f = foto_dir() . $c . '.' . $e;
+        if (is_file($f)) return 'assets/img/productos/' . $c . '.' . $e . '?v=' . filemtime($f);
+    }
+    return null;
+}
+function borrar_fotos(string $codigo): void {
+    $c = foto_codigo($codigo); if ($c === '') return;
+    foreach (FOTO_EXT as $e) { $f = foto_dir() . $c . '.' . $e; if (is_file($f)) @unlink($f); }
+}
+// Guarda la foto subida desde el panel (reemplaza la anterior).
+function guardar_foto(string $codigo, array $f): void {
+    if (($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) return;
+    if ($f['error'] !== UPLOAD_ERR_OK) throw new RuntimeException('El servidor no pudo recibir el archivo (código ' . $f['error'] . ').');
+    if ($f['size'] > 3 * 1024 * 1024) throw new RuntimeException('La imagen supera los 3 MB.');
+    $info = @getimagesize($f['tmp_name']);
+    $ext = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'][$info['mime'] ?? ''] ?? null;
+    if (!$ext) throw new RuntimeException('Formato no permitido. Usa JPG, PNG o WEBP.');
+    $c = foto_codigo($codigo); if ($c === '') throw new RuntimeException('Código de producto inválido.');
+    if (!is_dir(foto_dir())) @mkdir(foto_dir(), 0755, true);
+    borrar_fotos($c);
+    if (!move_uploaded_file($f['tmp_name'], foto_dir() . $c . '.' . $ext)) throw new RuntimeException('No se pudo guardar la imagen en el servidor.');
+}
+
+
+############################################################
+# ARCHIVO: index.php
+# Catálogo de la tienda: filtros, búsqueda, orden y paginación
+############################################################
+<?php
+require_once __DIR__ . '/config.php';
+$q = trim($_GET['q'] ?? ''); $cat = $_GET['cat'] ?? ''; $orden = $_GET['orden'] ?? ''; $disp = !empty($_GET['disp']);
+$pag = max(1, (int)($_GET['p'] ?? 1)); $por = 12; $E = CAT_SQL;
+$items = []; $cats = []; $total = 0; $paginas = 1; $totalAll = 0; $error = null;
+try {
+    $pdo = db(); $where = ['1=1']; $par = [];
+    if ($cat !== '') { $where[] = "$E = :cat"; $par[':cat'] = $cat; }
+    if ($q !== '')   { $where[] = '(nombre LIKE :q1 OR codigo_producto LIKE :q2)'; $par[':q1'] = $par[':q2'] = "%$q%"; }
+    if ($disp) $where[] = 'stock_actual > 0';
+    $w = implode(' AND ', $where);
+    $orderBy = ['precio_asc' => 'precio_venta ASC', 'precio_desc' => 'precio_venta DESC', 'nombre' => 'nombre ASC'][$orden] ?? 'codigo_producto ASC';
+    $st = $pdo->prepare("SELECT COUNT(*) FROM productos WHERE $w"); $st->execute($par); $total = (int)$st->fetchColumn();
+    $paginas = max(1, (int)ceil($total / $por)); $pag = min($pag, $paginas); $off = ($pag - 1) * $por;
+    $st = $pdo->prepare("SELECT codigo_producto, nombre, $E AS cat, stock_actual, precio_venta FROM productos WHERE $w ORDER BY $orderBy LIMIT $por OFFSET $off");
+    $st->execute($par); $items = $st->fetchAll();
+    $cats = $pdo->query("SELECT $E AS cat, COUNT(*) n FROM productos GROUP BY cat ORDER BY n DESC")->fetchAll();
+    $totalAll = array_sum(array_column($cats, 'n'));
+} catch (PDOException $e) { $error = $e->getMessage(); }
+include __DIR__ . '/includes/header.php';
+?>
+<section class="hero"><div class="wrap hero-in"><div class="hero-tx">
+  <p class="eyebrow">Tienda virtual</p>
+  <h1>Repuestos que mantienen tu moto <em>en ruta</em></h1>
+  <p class="lead">Catálogo de repuestos nuevos y usados, accesorios, líquidos y más para KLR 650, DR 650 y V-Strom.</p>
+  <div class="stats"><div><b><?= $totalAll ?></b>productos</div><div><b><?= count($cats) ?></b>categorías</div><div><b>COP</b>precios claros</div></div></div><img class="hero-logo" src="assets/img/logo.jpg" alt="Logo M-PARTS Repuestos y Accesorios">
+</div></section>
+
+<main class="wrap">
+<?php if ($error): ?>
+  <div class="alert"><b>No se pudo conectar con la base de datos.</b><br>Revisa los datos en <code>config.php</code> y que MySQL esté activo en XAMPP.<br><small><?= h($error) ?></small></div>
+<?php else: ?>
+  <nav class="chips" aria-label="Categorías">
+    <a class="<?= $cat === '' ? 'on' : '' ?>" href="<?= h(url(['cat' => '', 'p' => ''])) ?>">Todo <small><?= $totalAll ?></small></a>
+    <?php foreach ($cats as $c): ?>
+      <a class="<?= $cat === $c['cat'] ? 'on' : '' ?>" href="<?= h(url(['cat' => $c['cat'], 'p' => ''])) ?>"><?= cat_icon($c['cat']) ?> <?= h(cat_label($c['cat'])) ?> <small><?= $c['n'] ?></small></a>
+    <?php endforeach; ?>
+  </nav>
+
+  <div class="bar">
+    <p><b><?= $total ?></b> resultado<?= $total == 1 ? '' : 's' ?><?= $q !== '' ? ' para “' . h($q) . '”' : '' ?></p>
+    <form method="get">
+      <input type="hidden" name="q" value="<?= h($q) ?>"><input type="hidden" name="cat" value="<?= h($cat) ?>">
+      <label class="chk"><input type="checkbox" name="disp" value="1" <?= $disp ? 'checked' : '' ?> onchange="this.form.submit()"> Solo disponibles</label>
+      <select name="orden" onchange="this.form.submit()" aria-label="Ordenar">
+        <?php foreach (['' => 'Más recientes', 'precio_asc' => 'Precio: menor a mayor', 'precio_desc' => 'Precio: mayor a menor', 'nombre' => 'Nombre A-Z'] as $v => $l): ?>
+          <option value="<?= $v ?>" <?= $orden === $v ? 'selected' : '' ?>><?= $l ?></option>
+        <?php endforeach; ?>
+      </select>
+    </form>
+  </div>
+
+  <?php if (!$items): ?>
+    <div class="empty">😕 No encontramos productos con ese filtro. <a href="index.php">Ver todo el catálogo</a></div>
+  <?php else: ?>
+  <div class="grid">
+    <?php foreach ($items as $p): [$txt, $cls] = stock_badge($p['stock_actual']); ?>
+      <a class="card" href="producto.php?codigo=<?= urlencode($p['codigo_producto']) ?>">
+        <div class="thumb"><?php if ($ph = foto($p['codigo_producto'])): ?><img src="<?= h($ph) ?>" alt="<?= h(nombre($p['nombre'])) ?>" loading="lazy"><?php else: ?><span><?= cat_icon($p['cat']) ?></span><?php endif; ?><em class="badge <?= $cls ?>"><?= $txt ?></em></div>
+        <div class="info">
+          <small class="cat"><?= h(cat_label($p['cat'])) ?></small>
+          <h3><?= h(nombre($p['nombre'])) ?></h3>
+          <small class="stk <?= $cls ?>"><?= $p['stock_actual'] > 0 ? (int)$p['stock_actual'] . ' disponibles' : 'Sin stock' ?></small>
+          <div class="row"><strong><?= cop($p['precio_venta']) ?></strong><code><?= h($p['codigo_producto']) ?></code></div>
+        </div>
+      </a>
+    <?php endforeach; ?>
+  </div>
+  <?php if ($paginas > 1): ?>
+  <nav class="pager" aria-label="Páginas">
+    <?php if ($pag > 1): ?><a href="<?= h(url(['p' => $pag - 1])) ?>">‹</a><?php endif; ?>
+    <?php for ($i = 1; $i <= $paginas; $i++): ?><a class="<?= $i == $pag ? 'on' : '' ?>" href="<?= h(url(['p' => $i])) ?>"><?= $i ?></a><?php endfor; ?>
+    <?php if ($pag < $paginas): ?><a href="<?= h(url(['p' => $pag + 1])) ?>">›</a><?php endif; ?>
+  </nav>
+  <?php endif; endif; endif; ?>
+</main>
+<?php include __DIR__ . '/includes/footer.php'; ?>
+
+
+############################################################
+# ARCHIVO: producto.php
+# Detalle de un producto y productos relacionados
+############################################################
+<?php
+require_once __DIR__ . '/config.php';
+$codigo = $_GET['codigo'] ?? ''; $p = null; $rel = []; $error = null; $E = CAT_SQL;
+try {
+    $st = db()->prepare("SELECT codigo_producto, nombre, $E AS cat, stock_actual, precio_venta FROM productos WHERE codigo_producto = :c");
+    $st->execute([':c' => $codigo]); $p = $st->fetch();
+    if ($p) {
+        $st = db()->prepare("SELECT codigo_producto, nombre, $E AS cat, stock_actual, precio_venta FROM productos WHERE $E = :cat AND codigo_producto <> :c ORDER BY RAND() LIMIT 4");
+        $st->execute([':cat' => $p['cat'], ':c' => $codigo]); $rel = $st->fetchAll();
+    }
+} catch (PDOException $e) { $error = $e->getMessage(); }
+if (!$p && !$error) http_response_code(404);
+$titulo = $p ? nombre($p['nombre']) . ' | M-PARTS' : 'Producto no encontrado | M-PARTS';
+include __DIR__ . '/includes/header.php';
+?>
+<main class="wrap">
+<?php if ($error): ?>
+  <div class="alert"><b>Error de base de datos.</b><br><small><?= h($error) ?></small></div>
+<?php elseif (!$p): ?>
+  <div class="empty">Producto no encontrado. <a href="index.php">Volver al catálogo</a></div>
+<?php else: [$txt, $cls] = stock_badge($p['stock_actual']);
+  $msg = 'Hola M-PARTS, me interesa: ' . nombre($p['nombre']) . ' (código ' . $p['codigo_producto'] . ').'; ?>
+  <p class="crumbs"><a href="index.php">Catálogo</a> › <a href="<?= h(url(['cat' => $p['cat'], 'q' => '', 'p' => ''])) ?>"><?= h(cat_label($p['cat'])) ?></a> › <?= h(nombre($p['nombre'])) ?></p>
+  <section class="detail">
+    <div class="thumb big"><?php if ($ph = foto($p['codigo_producto'])): ?><img src="<?= h($ph) ?>" alt="<?= h(nombre($p['nombre'])) ?>" loading="lazy"><?php else: ?><span><?= cat_icon($p['cat']) ?></span><?php endif; ?></div>
+    <div>
+      <small class="cat"><?= h(cat_label($p['cat'])) ?></small>
+      <h1><?= h(nombre($p['nombre'])) ?></h1>
+      <p class="price"><?= cop($p['precio_venta']) ?></p>
+      <p><span class="badge <?= $cls ?>"><?= $txt ?></span> <span class="muted"><?= (int)$p['stock_actual'] ?> unidades en stock</span></p>
+      <div class="meter"><i class="<?= $cls ?>" style="width:<?= min(100, max(3, $p['stock_actual'] * 2)) ?>%"></i></div>
+      <ul class="facts"><li><span>Código</span><b><?= h($p['codigo_producto']) ?></b></li><li><span>Categoría</span><b><?= h(cat_label($p['cat'])) ?></b></li></ul>
+      <a class="btn big-btn" href="https://wa.me/<?= WHATSAPP ?>?text=<?= urlencode($msg) ?>" target="_blank" rel="noopener"><?= $p['stock_actual'] > 0 ? 'Pedir por WhatsApp' : 'Consultar disponibilidad' ?></a>
+      <a class="btn ghost" href="index.php">← Seguir viendo</a>
+    </div>
+  </section>
+  <?php if ($rel): ?>
+  <h2 class="sec">También te puede interesar</h2>
+  <div class="grid">
+    <?php foreach ($rel as $r): [$t2, $c2] = stock_badge($r['stock_actual']); ?>
+      <a class="card" href="producto.php?codigo=<?= urlencode($r['codigo_producto']) ?>">
+        <div class="thumb"><?php if ($ph = foto($r['codigo_producto'])): ?><img src="<?= h($ph) ?>" alt="<?= h(nombre($r['nombre'])) ?>" loading="lazy"><?php else: ?><span><?= cat_icon($r['cat']) ?></span><?php endif; ?><em class="badge <?= $c2 ?>"><?= $t2 ?></em></div>
+        <div class="info"><small class="cat"><?= h(cat_label($r['cat'])) ?></small><h3><?= h(nombre($r['nombre'])) ?></h3>
+        <small class="stk <?= $c2 ?>"><?= $r['stock_actual'] > 0 ? (int)$r['stock_actual'] . ' disponibles' : 'Sin stock' ?></small>
+        <div class="row"><strong><?= cop($r['precio_venta']) ?></strong><code><?= h($r['codigo_producto']) ?></code></div></div>
+      </a>
+    <?php endforeach; ?>
+  </div>
+  <?php endif; endif; ?>
+</main>
+<?php include __DIR__ . '/includes/footer.php'; ?>
+
+
+############################################################
+# ARCHIVO: includes/header.php
+# Encabezado de la tienda
+############################################################
+<?php require_once __DIR__ . '/../config.php'; require_once __DIR__ . '/fotos.php'; $titulo = $titulo ?? 'M-PARTS | Repuestos para motos'; ?>
+<!DOCTYPE html>
+<html lang="es"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title><?= h($titulo) ?></title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="assets/img/logo.jpg"><meta name="theme-color" content="#0b0c0f">
+<link rel="stylesheet" href="assets/css/style.css?v=4">
+</head><body>
+<header class="nav"><div class="wrap nav-in">
+  <a class="logo" href="index.php"><b>M-</b>PARTS</a>
+  <form class="search" action="index.php" method="get">
+    <input name="q" value="<?= h($_GET['q'] ?? '') ?>" placeholder="Buscar repuesto o código…" aria-label="Buscar">
+    <button>Buscar</button>
+  </form>
+  <a class="btn wa" href="https://wa.me/<?= WHATSAPP ?>" target="_blank" rel="noopener">WhatsApp</a>
+</div></header>
+
+
+############################################################
+# ARCHIVO: includes/footer.php
+# Pie de página con contacto y redes sociales
+############################################################
+<footer class="foot"><div class="wrap foot-grid">
+  <div><div class="logo"><b>M-</b>PARTS</div><p class="muted">Repuestos y accesorios para motos. Precios en pesos colombianos (COP).</p></div>
+  <div><h4>Contacto</h4><?php foreach (CONTACTO as $k => $v): ?><p class="muted"><?= h($k) ?>: <?= h($v) ?></p><?php endforeach; ?></div>
+  <div><h4>Síguenos</h4><div class="social">
+    <?php foreach (SOCIAL as $n => $u): if ($u): ?><a href="<?= h($u) ?>" target="_blank" rel="noopener"><?= h($n) ?></a><?php endif; endforeach; ?>
+    <a href="https://wa.me/<?= WHATSAPP ?>" target="_blank" rel="noopener">WhatsApp</a>
+  </div></div>
+</div>
+<div class="wrap copy">Proyecto Integrador · FESC · <?= date('Y') ?> · <a href="admin/">Acceso administrador</a></div>
+</footer>
+</body></html>
+
+
+############################################################
+# ARCHIVO: admin/includes/schema.php
+# Definición de las 7 tablas que se administran
+############################################################
+<?php
+// Define cómo se administra cada tabla. Si agregas columnas en MySQL, agrégalas aquí en 'fields'.
+$fkProd = ['productos', 'codigo_producto', "CONCAT(codigo_producto,' · ',nombre)"];
+return [
+ 'productos' => ['label' => 'Productos', 'icon' => '📦', 'pk' => 'codigo_producto', 'auto' => false,
+   'list' => ['codigo_producto', 'nombre', 'categoria', 'stock_actual', 'costo_unitario', 'precio_venta'],
+   'search' => ['codigo_producto', 'nombre', 'categoria'],
+   'fields' => [
+     'codigo_producto' => ['Código (ej. A196)', 'text'], 'nombre' => ['Nombre', 'text'],
+     'categoria' => ['Categoría', 'text', 'datalist' => 'SELECT DISTINCT categoria FROM productos ORDER BY 1'],
+     'compras_iniciales' => ['Compras iniciales', 'number'], 'ventas_registradas' => ['Ventas registradas', 'number'],
+     'stock_actual' => ['Stock actual', 'number'], 'costo_unitario' => ['Costo unitario (COP)', 'money'], 'precio_venta' => ['Precio de venta (COP)', 'money']]],
+ 'clientes' => ['label' => 'Clientes', 'icon' => '👤', 'pk' => 'id_cliente', 'auto' => false,
+   'list' => ['id_cliente', 'nombre', 'apellido', 'telefono', 'correo', 'ciudad'], 'search' => ['id_cliente', 'nombre', 'apellido', 'correo', 'ciudad'],
+   'fields' => ['id_cliente' => ['Documento / ID', 'number'], 'nombre' => ['Nombre', 'text'], 'apellido' => ['Apellido', 'text'],
+     'sexo' => ['Sexo', 'text', 'opts' => ['M', 'F']], 'telefono' => ['Teléfono', 'text'], 'correo' => ['Correo', 'email'],
+     'direccion' => ['Dirección', 'text'], 'ciudad' => ['Ciudad', 'text']]],
+ 'proveedores' => ['label' => 'Proveedores', 'icon' => '🏭', 'pk' => 'id_proveedor', 'auto' => false,
+   'list' => ['id_proveedor', 'empresa', 'contacto', 'telefono', 'tipo'], 'search' => ['id_proveedor', 'empresa', 'contacto', 'tipo'],
+   'fields' => ['id_proveedor' => ['ID proveedor', 'text'], 'empresa' => ['Empresa', 'text'], 'contacto' => ['Contacto', 'text'],
+     'telefono' => ['Teléfono', 'text'], 'correo' => ['Correo', 'email'], 'direccion' => ['Dirección', 'text'], 'tipo' => ['Tipo', 'text']]],
+ 'trabajadores' => ['label' => 'Trabajadores', 'icon' => '🧑‍🔧', 'pk' => 'id_trabajador', 'auto' => false,
+   'list' => ['id_trabajador', 'nombre', 'apellido', 'telefono', 'cargo'], 'search' => ['id_trabajador', 'nombre', 'apellido', 'cargo'],
+   'fields' => ['id_trabajador' => ['Documento / ID', 'number'], 'nombre' => ['Nombre', 'text'], 'apellido' => ['Apellido', 'text'],
+     'direccion' => ['Dirección', 'text'], 'telefono' => ['Teléfono', 'text'], 'correo' => ['Correo', 'email'],
+     'cargo' => ['Cargo', 'text'], 'genero' => ['Género', 'text', 'opts' => ['M', 'F']]]],
+ 'entradas' => ['label' => 'Entradas (compras)', 'icon' => '📥', 'pk' => 'id_entrada', 'auto' => true,
+   'list' => ['id_entrada', 'fecha', 'codigo_producto', 'cantidad', 'costo_unitario', 'total', 'id_proveedor'], 'search' => ['codigo_producto', 'id_proveedor', 'categoria'],
+   'fields' => ['id_entrada' => ['ID', 'number'], 'codigo_producto' => ['Producto', 'text', 'fk' => $fkProd], 'fecha' => ['Fecha', 'date'],
+     'categoria' => ['Categoría', 'text', 'datalist' => 'SELECT DISTINCT categoria FROM productos ORDER BY 1'],
+     'costo_unitario' => ['Costo unitario', 'money'], 'cantidad' => ['Cantidad', 'number'],
+     'id_proveedor' => ['Proveedor', 'text', 'fk' => ['proveedores', 'id_proveedor', "CONCAT(empresa,' (',id_proveedor,')')"]], 'total' => ['Total', 'money']]],
+ 'ventas' => ['label' => 'Ventas', 'icon' => '🧾', 'pk' => 'id_venta', 'auto' => true,
+   'list' => ['id_venta', 'fecha', 'id_cliente', 'id_trabajador', 'metodo_pago', 'total'], 'search' => ['id_venta', 'id_cliente', 'metodo_pago'],
+   'fields' => ['id_venta' => ['ID', 'number'], 'fecha' => ['Fecha', 'date'],
+     'id_cliente' => ['Cliente', 'number', 'fk' => ['clientes', 'id_cliente', "CONCAT(nombre,' ',apellido,' (',id_cliente,')')"]],
+     'id_trabajador' => ['Vendedor', 'number', 'fk' => ['trabajadores', 'id_trabajador', "CONCAT(nombre,' ',apellido)"]],
+     'metodo_pago' => ['Método de pago', 'text', 'datalist' => 'SELECT DISTINCT metodo_pago FROM ventas ORDER BY 1'], 'total' => ['Total', 'money']]],
+ 'detalle_venta' => ['label' => 'Detalle de venta', 'icon' => '🛒', 'pk' => 'id_detalle', 'auto' => true,
+   'list' => ['id_detalle', 'id_venta', 'codigo_producto', 'cantidad', 'precio_unitario', 'subtotal'], 'search' => ['id_venta', 'codigo_producto'],
+   'fields' => ['id_detalle' => ['ID', 'number'], 'id_venta' => ['Venta', 'number', 'fk' => ['ventas', 'id_venta', "CONCAT('Venta #',id_venta,' · ',DATE(fecha))"]],
+     'codigo_producto' => ['Producto', 'text', 'fk' => $fkProd], 'cantidad' => ['Cantidad', 'number'],
+     'precio_unitario' => ['Precio unitario', 'money'], 'subtotal' => ['Subtotal', 'money']]],
+];
+
+
+############################################################
+# ARCHIVO: admin/includes/boot.php
+# Arranque del panel: sesión, conexión y fotos
+############################################################
+<?php
+require_once __DIR__ . '/../../config.php';
+require_admin();
+require_once __DIR__ . '/../../includes/fotos.php';
+$S = require __DIR__ . '/schema.php';
+$pdo = db();
+
+
+############################################################
+# ARCHIVO: admin/includes/top.php
+# Menú lateral del panel
+############################################################
+<?php $titulo = $titulo ?? 'Panel'; $activo = $activo ?? ''; $f = $_SESSION['flash'] ?? null; unset($_SESSION['flash']);
+function nav_a($href, $txt, $key, $activo) { return '<a class="' . ($key === $activo ? 'on' : '') . '" href="' . $href . '">' . $txt . '</a>'; } ?>
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title><?= h($titulo) ?> · M-PARTS Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="../assets/img/logo.jpg"><link rel="stylesheet" href="../assets/css/style.css?v=4"><link rel="stylesheet" href="../assets/css/admin.css?v=4">
+</head><body class="adm">
+<aside class="side"><a class="logo" href="index.php"><b>M-</b>PARTS <small>ADMIN</small></a>
+<nav>
+  <?= nav_a('index.php', '📊 Panel general', 'dash', $activo) ?>
+  <?= nav_a('movimientos.php', '💱 Entradas y salidas', 'mov', $activo) ?>
+  <?= nav_a('nueva_venta.php', '➕ Registrar venta', 'nv', $activo) ?>
+  <?= nav_a('nueva_entrada.php', '➕ Registrar entrada', 'ne', $activo) ?>
+  <p>Base de datos</p>
+  <?php foreach ($S as $nav_k => $nav_t) echo nav_a('tabla.php?t=' . $nav_k, $nav_t['icon'] . ' ' . h($nav_t['label']), $nav_k, $activo); ?>
+  <p>&nbsp;</p><?= nav_a('../index.php', '🏍️ Ver tienda', '', '') ?><?= nav_a('logout.php', '🚪 Cerrar sesión', '', '') ?>
+</nav></aside>
+<main class="mainc"><header class="topb"><h1><?= h($titulo) ?></h1></header>
+<?php if ($f): ?><div class="flash <?= $f[1] ?>"><?= h($f[0]) ?></div><?php endif; ?>
+
+
+############################################################
+# ARCHIVO: admin/includes/bottom.php
+# Cierre de la plantilla del panel
+############################################################
+</main></body></html>
+
+
+############################################################
+# ARCHIVO: admin/login.php
+# Acceso del administrador
+############################################################
+<?php
+require_once __DIR__ . '/../config.php';
+if (is_admin()) { header('Location: index.php'); exit; }
+$err = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    check_csrf();
+    if (hash_equals(ADMIN_USER, $_POST['u'] ?? '') && hash_equals(ADMIN_PASS, $_POST['p'] ?? '')) {
+        session_regenerate_id(true); $_SESSION['admin'] = true; header('Location: index.php'); exit;
+    }
+    sleep(1); $err = 'Usuario o contraseña incorrectos.';
+}
+?><!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acceso · M-PARTS Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<link rel="icon" href="../assets/img/logo.jpg"><link rel="stylesheet" href="../assets/css/style.css?v=4"><link rel="stylesheet" href="../assets/css/admin.css?v=4"></head>
+<body class="login"><form class="lbox" method="post"><div class="logo"><b>M-</b>PARTS</div><p class="muted">Panel de administración</p>
+<?php if ($err): ?><div class="flash err"><?= h($err) ?></div><?php endif; ?>
+<?= csrf_field() ?><label>Usuario<input name="u" required autofocus></label><label>Contraseña<input type="password" name="p" required></label>
+<button class="btn">Ingresar</button><a class="muted" href="../index.php">← Volver a la tienda</a></form></body></html>
+
+
+############################################################
+# ARCHIVO: admin/logout.php
+# Cierre de sesión
+############################################################
+<?php require_once __DIR__ . '/../config.php'; $_SESSION = []; session_destroy(); header('Location: login.php');
+
+
+############################################################
+# ARCHIVO: admin/index.php
+# Panel general con indicadores
+############################################################
+<?php
+require __DIR__ . '/includes/boot.php';
+$one = fn($sql) => $pdo->query($sql)->fetch(PDO::FETCH_NUM);
+[$vTot, $vN] = $one("SELECT COALESCE(SUM(total),0), COUNT(*) FROM ventas");
+[$eTot, $eN] = $one("SELECT COALESCE(SUM(total),0), COUNT(*) FROM entradas");
+[$invC, $invV, $nProd] = $one("SELECT COALESCE(SUM(stock_actual*costo_unitario),0), COALESCE(SUM(stock_actual*precio_venta),0), COUNT(*) FROM productos");
+[$bajo] = $one("SELECT COUNT(*) FROM productos WHERE stock_actual <= 5");
+[$util] = $one("SELECT COALESCE(SUM(d.subtotal - d.cantidad*p.costo_unitario),0) FROM detalle_venta d JOIN productos p ON p.codigo_producto=d.codigo_producto");
+$meses = array_reverse($pdo->query("SELECT DATE_FORMAT(fecha,'%Y-%m') m, SUM(total) t FROM ventas GROUP BY m ORDER BY m DESC LIMIT 12")->fetchAll());
+$maxM = max(array_merge([1], array_column($meses, 't')));
+$pagos = $pdo->query("SELECT metodo_pago, COUNT(*) n, SUM(total) t FROM ventas GROUP BY metodo_pago ORDER BY t DESC")->fetchAll();
+$top = $pdo->query("SELECT p.nombre, SUM(d.cantidad) u, SUM(d.subtotal) t FROM detalle_venta d JOIN productos p ON p.codigo_producto=d.codigo_producto GROUP BY d.codigo_producto, p.nombre ORDER BY u DESC LIMIT 5")->fetchAll();
+$ult = $pdo->query("SELECT v.id_venta, v.fecha, CONCAT(c.nombre,' ',c.apellido) cli, v.metodo_pago, v.total FROM ventas v LEFT JOIN clientes c ON c.id_cliente=v.id_cliente ORDER BY v.fecha DESC, v.id_venta DESC LIMIT 6")->fetchAll();
+$low = $pdo->query("SELECT codigo_producto, nombre, stock_actual FROM productos WHERE stock_actual <= 5 ORDER BY stock_actual ASC, nombre LIMIT 6")->fetchAll();
+$titulo = 'Panel general'; $activo = 'dash'; include __DIR__ . '/includes/top.php';
+?>
+<section class="kpis">
+  <div class="kpi"><small>Ventas totales</small><b><?= cop($vTot) ?></b><span><?= $vN ?> ventas</span></div>
+  <div class="kpi"><small>Compras de mercancía</small><b><?= cop($eTot) ?></b><span><?= $eN ?> entradas</span></div>
+  <div class="kpi"><small>Utilidad bruta estimada</small><b><?= cop($util) ?></b><span>ventas − costo de lo vendido</span></div>
+  <div class="kpi"><small>Valor del inventario</small><b><?= cop($invC) ?></b><span>a costo · <?= cop($invV) ?> a precio de venta</span></div>
+  <div class="kpi"><small>Productos</small><b><?= $nProd ?></b><span><?= $bajo ?> con stock bajo (≤ 5)</span></div>
+</section>
+<section class="cols">
+  <div class="panel"><h2>Ventas por mes</h2>
+    <?php foreach ($meses as $x): ?><div class="hbar"><span><?= h($x['m']) ?></span><div><i style="width:<?= round($x['t'] / $maxM * 100) ?>%"></i></div><b><?= cop($x['t']) ?></b></div><?php endforeach; ?>
+    <?php if (!$meses): ?><p class="muted">Aún no hay ventas.</p><?php endif; ?></div>
+  <div class="panel"><h2>Métodos de pago</h2>
+    <?php foreach ($pagos as $x): ?><div class="hbar"><span><?= h($x['metodo_pago']) ?></span><div><i style="width:<?= $vTot ? round($x['t'] / $vTot * 100) : 0 ?>%"></i></div><b><?= $x['n'] ?> · <?= cop($x['t']) ?></b></div><?php endforeach; ?></div>
+</section>
+<section class="cols">
+  <div class="panel"><h2>Productos más vendidos</h2><table><tbody>
+    <?php foreach ($top as $x): ?><tr><td><?= h(nombre($x['nombre'])) ?></td><td class="num"><?= (int)$x['u'] ?> und.</td><td class="num"><?= cop($x['t']) ?></td></tr><?php endforeach; ?></tbody></table></div>
+  <div class="panel"><h2>Stock bajo <a class="more" href="tabla.php?t=productos">ver productos</a></h2><table><tbody>
+    <?php foreach ($low as $x): ?><tr><td><?= h(nombre($x['nombre'])) ?> <code><?= h($x['codigo_producto']) ?></code></td><td class="num"><span class="badge <?= $x['stock_actual'] <= 0 ? 'out' : 'low' ?>"><?= (int)$x['stock_actual'] ?> und.</span></td></tr><?php endforeach; ?>
+    <?php if (!$low): ?><tr><td class="muted">Todo el inventario tiene stock suficiente.</td></tr><?php endif; ?></tbody></table></div>
+</section>
+<div class="panel"><h2>Últimas ventas <a class="more" href="tabla.php?t=ventas">ver todas</a></h2><div class="tw"><table><thead><tr><th>#</th><th>Fecha</th><th>Cliente</th><th>Pago</th><th>Total</th></tr></thead><tbody>
+  <?php foreach ($ult as $x): ?><tr><td><?= $x['id_venta'] ?></td><td><?= h(substr($x['fecha'], 0, 10)) ?></td><td><?= h($x['cli']) ?></td><td><?= h($x['metodo_pago']) ?></td><td class="num"><?= cop($x['total']) ?></td></tr><?php endforeach; ?></tbody></table></div></div>
+<?php include __DIR__ . '/includes/bottom.php';
+
+
+############################################################
+# ARCHIVO: admin/tabla.php
+# CRUD genérico para las 7 tablas (con subida de fotos en productos)
+############################################################
+<?php
+require __DIR__ . '/includes/boot.php';
+$t = $_GET['t'] ?? ''; if (!isset($S[$t])) { header('Location: index.php'); exit; }
+$T = $S[$t]; $pk = $T['pk']; $m = $_GET['m'] ?? 'list'; $id = $_GET['id'] ?? '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    check_csrf(); $act = $_POST['act'] ?? ''; $back = 'tabla.php?t=' . $t;
+    try {
+        if ($act === 'delete') {
+            $pdo->prepare("DELETE FROM `$t` WHERE `$pk`=?")->execute([$_POST['id']]);
+            if ($t === 'productos') borrar_fotos($_POST['id']);
+            flash('Registro eliminado.');
+        } elseif ($act === 'save') {
+            $orig = $_POST['orig'] ?? ''; $vals = [];
+            foreach ($T['fields'] as $c => $f) {
+                if ($c === $pk && ($T['auto'] || $orig !== '')) continue;
+                $v = trim($_POST[$c] ?? ''); $vals[$c] = $v === '' ? null : $v;
+            }
+            if ($orig !== '') {
+                $set = implode(',', array_map(fn($c) => "`$c`=?", array_keys($vals)));
+                $pdo->prepare("UPDATE `$t` SET $set WHERE `$pk`=?")->execute([...array_values($vals), $orig]);
+            } else {
+                if ($T['auto']) $vals = [$pk => next_id($pdo, $t, $pk)] + $vals;
+                $cols = implode(',', array_map(fn($c) => "`$c`", array_keys($vals)));
+                $pdo->prepare("INSERT INTO `$t` ($cols) VALUES (" . implode(',', array_fill(0, count($vals), '?')) . ')')->execute(array_values($vals));
+            }
+            if ($t === 'productos') {
+                try { guardar_foto($orig !== '' ? $orig : (string)($vals[$pk] ?? ''), $_FILES['foto'] ?? []); }
+                catch (RuntimeException $e) { flash('Producto guardado, pero la imagen no: ' . $e->getMessage(), 'err'); header('Location: ' . $back); exit; }
+            }
+            flash('Guardado correctamente.');
+        }
+    } catch (PDOException $e) {
+        flash('No se pudo completar la acción: ' . $e->getMessage(), 'err');
+        if ($act === 'save') $back .= '&m=form' . (($_POST['orig'] ?? '') !== '' ? '&id=' . urlencode($_POST['orig']) : '');
+    }
+    header('Location: ' . $back); exit;
+}
+
+$titulo = $T['label']; $activo = $t;
+include __DIR__ . '/includes/top.php';
+
+if ($m === 'form') {
+    $row = []; $edit = $id !== '';
+    if ($edit) { $st = $pdo->prepare("SELECT * FROM `$t` WHERE `$pk`=?"); $st->execute([$id]); $row = $st->fetch() ?: []; }
+    echo '<form class="panel form" method="post" enctype="multipart/form-data"><h2>' . ($edit ? 'Editar' : 'Nuevo') . ' registro</h2>' . csrf_field()
+       . '<input type="hidden" name="act" value="save"><input type="hidden" name="orig" value="' . h($edit ? $id : '') . '"><div class="fgrid">';
+    foreach ($T['fields'] as $c => $f) {
+        if ($c === $pk && $T['auto']) continue;
+        $val = $row[$c] ?? ''; $ro = ($c === $pk && $edit);
+        echo '<label>' . h($f[0]);
+        if (isset($f['fk'])) {
+            [$ft, $fv, $fl] = $f['fk'];
+            echo '<select name="' . $c . '"><option value="">— ninguno —</option>';
+            foreach ($pdo->query("SELECT `$fv` v, $fl l FROM `$ft` ORDER BY 1")->fetchAll() as $o)
+                echo '<option value="' . h($o['v']) . '"' . ((string)$o['v'] === (string)$val ? ' selected' : '') . '>' . h($o['l']) . '</option>';
+            echo '</select>';
+        } elseif (isset($f['opts'])) {
+            echo '<select name="' . $c . '"><option value="">—</option>';
+            foreach ($f['opts'] as $o) echo '<option' . ($o === $val ? ' selected' : '') . '>' . h($o) . '</option>';
+            echo '</select>';
+        } else {
+            $type = in_array($f[1], ['number', 'money']) ? 'number' : $f[1];
+            if ($f[1] === 'date') $val = substr((string)$val, 0, 10);
+            echo '<input type="' . $type . '" name="' . $c . '" value="' . h($val) . '"' . ($type === 'number' ? ' step="any"' : '') . ($ro ? ' readonly' : '') . (isset($f['datalist']) ? ' list="dl_' . $c . '"' : '') . '>';
+            if (isset($f['datalist'])) { echo '<datalist id="dl_' . $c . '">'; foreach ($pdo->query($f['datalist'])->fetchAll(PDO::FETCH_COLUMN) as $o) echo '<option value="' . h($o) . '">'; echo '</datalist>'; }
+        }
+        echo '</label>';
+    }
+    echo '</div>';
+    if ($t === 'productos') {
+        $ph = $edit ? foto($id) : null;
+        echo '<div class="fotobox">' . ($ph ? '<img class="mini big" src="../' . h($ph) . '" alt="">' : '<div class="mini big ph">📷</div>')
+           . '<label>Foto del producto (JPG, PNG o WEBP, máx. 3 MB)<input type="file" name="foto" accept="image/jpeg,image/png,image/webp"></label></div>';
+    }
+    echo '<div class="acts"><button class="btn">Guardar</button><a class="btn ghost" href="tabla.php?t=' . $t . '">Cancelar</a></div>';
+    if ($t === 'productos') echo '<p class="muted">Los productos nuevos aparecen automáticamente en el catálogo de la tienda.</p>';
+    if (in_array($t, ['ventas', 'entradas', 'detalle_venta'])) echo '<p class="muted">Editar aquí no ajusta el stock. Para que el inventario se actualice, usa “Registrar venta” o “Registrar entrada”.</p>';
+    echo '</form>';
+} else {
+    $q = trim($_GET['q'] ?? ''); $pag = max(1, (int)($_GET['p'] ?? 1)); $por = 15; $w = '1=1'; $par = [];
+    if ($q !== '') { $w = '(' . implode(' OR ', array_map(fn($c) => "`$c` LIKE ?", $T['search'])) . ')'; $par = array_fill(0, count($T['search']), "%$q%"); }
+    $st = $pdo->prepare("SELECT COUNT(*) FROM `$t` WHERE $w"); $st->execute($par); $n = (int)$st->fetchColumn();
+    $pags = max(1, (int)ceil($n / $por)); $pag = min($pag, $pags); $off = ($pag - 1) * $por;
+    $cols = implode(',', array_map(fn($c) => "`$c`", $T['list']));
+    $st = $pdo->prepare("SELECT $cols FROM `$t` WHERE $w ORDER BY `$pk` " . ($T['auto'] ? 'DESC' : 'ASC') . " LIMIT $por OFFSET $off"); $st->execute($par); $rows = $st->fetchAll();
+    echo '<div class="toolbar"><form><input type="hidden" name="t" value="' . $t . '"><input name="q" value="' . h($q) . '" placeholder="Buscar…"><button class="btn ghost">Buscar</button></form>'
+       . '<span class="muted">' . $n . ' registros</span><a class="btn" href="tabla.php?t=' . $t . '&m=form">+ Nuevo</a></div>';
+    echo '<div class="panel tw"><table><thead><tr>';
+    if ($t === 'productos') echo '<th>Foto</th>';
+    foreach ($T['list'] as $c) echo '<th>' . h($T['fields'][$c][0]) . '</th>';
+    echo '<th></th></tr></thead><tbody>';
+    foreach ($rows as $r) {
+        echo '<tr>';
+        if ($t === 'productos') echo '<td>' . (($ph = foto($r[$pk])) ? '<img class="mini" src="../' . h($ph) . '" alt="">' : '<span class="muted">—</span>') . '</td>';
+        foreach ($T['list'] as $c) {
+            $ft = $T['fields'][$c][1]; $v = $r[$c];
+            echo '<td' . ($ft === 'money' || $ft === 'number' ? ' class="num"' : '') . '>' . h($ft === 'money' && $v !== null ? cop($v) : ($ft === 'date' ? substr((string)$v, 0, 10) : $v)) . '</td>';
+        }
+        echo '<td class="ra"><a href="tabla.php?t=' . $t . '&m=form&id=' . urlencode($r[$pk]) . '">Editar</a>'
+           . '<form method="post" onsubmit="return confirm(\'¿Eliminar este registro? No se puede deshacer.\')">' . csrf_field()
+           . '<input type="hidden" name="act" value="delete"><input type="hidden" name="id" value="' . h($r[$pk]) . '"><button class="del">Eliminar</button></form></td></tr>';
+    }
+    if (!$rows) echo '<tr><td colspan="' . (count($T['list']) + ($t === 'productos' ? 2 : 1)) . '" class="muted">Sin resultados.</td></tr>';
+    echo '</tbody></table></div>';
+    if ($pags > 1) { echo '<nav class="pager">'; for ($i = 1; $i <= $pags; $i++) echo '<a class="' . ($i == $pag ? 'on' : '') . '" href="tabla.php?' . h(http_build_query(['t' => $t, 'q' => $q, 'p' => $i])) . '">' . $i . '</a>'; echo '</nav>'; }
+}
+include __DIR__ . '/includes/bottom.php';
+
+
+############################################################
+# ARCHIVO: admin/movimientos.php
+# Entradas y salidas de dinero (ventas y compras)
+############################################################
+<?php
+require __DIR__ . '/includes/boot.php';
+$tipo = $_GET['tipo'] ?? ''; $d = $_GET['desde'] ?? ''; $h = $_GET['hasta'] ?? ''; $pag = max(1, (int)($_GET['p'] ?? 1)); $por = 25;
+$base = "SELECT e.fecha, 'Entrada' AS tipo, CONCAT(COALESCE(p.nombre,e.codigo_producto),' × ',e.cantidad) AS detalle, e.total AS monto
+         FROM entradas e LEFT JOIN productos p ON p.codigo_producto=e.codigo_producto
+         UNION ALL SELECT v.fecha, 'Venta', CONCAT('Venta #',v.id_venta,' · ',v.metodo_pago), v.total FROM ventas v";
+$w = []; $par = [];
+if ($tipo === 'ingresos') $w[] = "tipo='Venta'"; elseif ($tipo === 'egresos') $w[] = "tipo='Entrada'";
+if ($d !== '') { $w[] = 'DATE(fecha) >= ?'; $par[] = $d; }
+if ($h !== '') { $w[] = 'DATE(fecha) <= ?'; $par[] = $h; }
+$W = $w ? 'WHERE ' . implode(' AND ', $w) : '';
+$st = $pdo->prepare("SELECT COALESCE(SUM(CASE WHEN tipo='Venta' THEN monto END),0), COALESCE(SUM(CASE WHEN tipo='Entrada' THEN monto END),0), COUNT(*) FROM ($base) m $W");
+$st->execute($par); [$ing, $egr, $n] = $st->fetch(PDO::FETCH_NUM);
+$pags = max(1, (int)ceil($n / $por)); $pag = min($pag, $pags); $off = ($pag - 1) * $por;
+$st = $pdo->prepare("SELECT * FROM ($base) m $W ORDER BY fecha DESC, tipo LIMIT $por OFFSET $off"); $st->execute($par); $rows = $st->fetchAll();
+$titulo = 'Entradas y salidas'; $activo = 'mov'; include __DIR__ . '/includes/top.php';
+?>
+<section class="kpis three">
+  <div class="kpi good"><small>Ingresos por ventas</small><b><?= cop($ing) ?></b></div>
+  <div class="kpi bad"><small>Egresos por compras de mercancía</small><b><?= cop($egr) ?></b></div>
+  <div class="kpi"><small>Balance del periodo</small><b class="<?= $ing - $egr >= 0 ? 'pos' : 'neg' ?>"><?= cop($ing - $egr) ?></b></div>
+</section>
+<form class="toolbar filt">
+  <select name="tipo"><?php foreach (['' => 'Todos los movimientos', 'ingresos' => 'Solo ventas (ingresos)', 'egresos' => 'Solo entradas (egresos)'] as $k => $l) echo '<option value="' . $k . '"' . ($tipo === $k ? ' selected' : '') . '>' . $l . '</option>'; ?></select>
+  <label>Desde <input type="date" name="desde" value="<?= h($d) ?>"></label><label>Hasta <input type="date" name="hasta" value="<?= h($h) ?>"></label>
+  <button class="btn ghost">Filtrar</button><a class="btn ghost" href="movimientos.php">Limpiar</a><span class="muted"><?= $n ?> movimientos</span>
+</form>
+<div class="panel tw"><table><thead><tr><th>Fecha</th><th>Tipo</th><th>Detalle</th><th>Monto</th></tr></thead><tbody>
+<?php foreach ($rows as $r): $in = $r['tipo'] === 'Venta'; ?>
+  <tr><td><?= h(substr($r['fecha'], 0, 10)) ?></td><td><span class="badge <?= $in ? 'ok' : 'low' ?>"><?= $in ? 'Venta · ingreso' : 'Entrada · egreso' ?></span></td><td><?= h($r['detalle']) ?></td>
+  <td class="num <?= $in ? 'pos' : 'neg' ?>"><?= $in ? '+' : '−' ?><?= cop($r['monto']) ?></td></tr>
+<?php endforeach; if (!$rows) echo '<tr><td colspan="4" class="muted">Sin movimientos para este filtro.</td></tr>'; ?></tbody></table></div>
+<?php if ($pags > 1): ?><nav class="pager"><?php for ($i = 1; $i <= $pags; $i++): ?><a class="<?= $i == $pag ? 'on' : '' ?>" href="movimientos.php?<?= h(http_build_query(['tipo' => $tipo, 'desde' => $d, 'hasta' => $h, 'p' => $i])) ?>"><?= $i ?></a><?php endfor; ?></nav><?php endif; ?>
+<?php include __DIR__ . '/includes/bottom.php';
+
+
+############################################################
+# ARCHIVO: admin/nueva_venta.php
+# Registro de ventas con descuento de stock
+############################################################
+<?php
+require __DIR__ . '/includes/boot.php';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    check_csrf();
+    try {
+        $cod = $_POST['cod'] ?? []; $cant = $_POST['cant'] ?? []; $pre = $_POST['precio'] ?? []; $lin = [];
+        foreach ($cod as $i => $c) if ($c !== '' && (int)$cant[$i] > 0) $lin[] = [$c, (int)$cant[$i], (float)$pre[$i]];
+        if (!$lin) throw new Exception('Agrega al menos un producto.');
+        if (empty($_POST['id_cliente']) || empty($_POST['id_trabajador'])) throw new Exception('Selecciona el cliente y el vendedor.');
+        $pdo->beginTransaction();
+        $total = array_sum(array_map(fn($l) => $l[1] * $l[2], $lin)); $idv = next_id($pdo, 'ventas', 'id_venta');
+        $pdo->prepare("INSERT INTO ventas (id_venta, fecha, id_cliente, id_trabajador, metodo_pago, total) VALUES (?,?,?,?,?,?)")
+            ->execute([$idv, $_POST['fecha'] ?: date('Y-m-d'), $_POST['id_cliente'], $_POST['id_trabajador'], $_POST['metodo_pago'], $total]);
+        foreach ($lin as [$c, $q, $p]) {
+            $s = $pdo->prepare("SELECT stock_actual, nombre FROM productos WHERE codigo_producto=? FOR UPDATE"); $s->execute([$c]); $pr = $s->fetch();
+            if (!$pr) throw new Exception("Producto $c no existe.");
+            if ($pr['stock_actual'] < $q) throw new Exception("Stock insuficiente de {$pr['nombre']} (hay {$pr['stock_actual']}).");
+            $pdo->prepare("INSERT INTO detalle_venta (id_detalle, id_venta, codigo_producto, cantidad, precio_unitario, subtotal) VALUES (?,?,?,?,?,?)")
+                ->execute([next_id($pdo, 'detalle_venta', 'id_detalle'), $idv, $c, $q, $p, $q * $p]);
+            $pdo->prepare("UPDATE productos SET stock_actual = stock_actual - ?, ventas_registradas = COALESCE(ventas_registradas,0) + ? WHERE codigo_producto=?")->execute([$q, $q, $c]);
+        }
+        $pdo->commit(); flash("Venta #$idv registrada por " . cop($total) . '. El stock se actualizó.'); header('Location: nueva_venta.php'); exit;
+    } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); flash($e->getMessage(), 'err'); header('Location: nueva_venta.php'); exit; }
+}
+$prods = array_map(fn($p) => ['c' => $p['codigo_producto'], 'n' => $p['nombre'], 's' => (int)$p['stock_actual'], 'p' => (float)$p['precio_venta']],
+    $pdo->query("SELECT codigo_producto, nombre, stock_actual, precio_venta FROM productos WHERE stock_actual > 0 ORDER BY nombre")->fetchAll());
+$cli = $pdo->query("SELECT id_cliente, CONCAT(nombre,' ',apellido) n FROM clientes ORDER BY nombre")->fetchAll();
+$trab = $pdo->query("SELECT id_trabajador, CONCAT(nombre,' ',apellido) n FROM trabajadores ORDER BY nombre")->fetchAll();
+$pagos = array_values(array_unique(array_merge(['EFECTIVO', 'TRANSFERENCIA', 'NEQUI', 'DAVIPLATA', 'TARJETA'], $pdo->query("SELECT DISTINCT metodo_pago FROM ventas WHERE metodo_pago IS NOT NULL")->fetchAll(PDO::FETCH_COLUMN))));
+$titulo = 'Registrar venta'; $activo = 'nv'; include __DIR__ . '/includes/top.php';
+?>
+<form class="panel form" method="post"><?= csrf_field() ?>
+  <div class="fgrid">
+    <label>Fecha<input type="date" name="fecha" value="<?= date('Y-m-d') ?>" required></label>
+    <label>Cliente<select name="id_cliente" required><option value="">Elegir…</option><?php foreach ($cli as $c) echo '<option value="' . h($c['id_cliente']) . '">' . h($c['n']) . ' (' . h($c['id_cliente']) . ')</option>'; ?></select></label>
+    <label>Vendedor<select name="id_trabajador" required><option value="">Elegir…</option><?php foreach ($trab as $c) echo '<option value="' . h($c['id_trabajador']) . '">' . h($c['n']) . '</option>'; ?></select></label>
+    <label>Método de pago<select name="metodo_pago"><?php foreach ($pagos as $p) echo '<option>' . h($p) . '</option>'; ?></select></label>
+  </div>
+  <div class="tw"><table class="lines"><thead><tr><th>Producto</th><th>Cant.</th><th>Precio unit.</th><th>Subtotal</th><th></th></tr></thead><tbody id="lines"></tbody></table></div>
+  <div class="acts"><button type="button" class="btn ghost" id="add">+ Agregar producto</button><span class="gt">Total: <b id="gt">$0</b></span><button class="btn">Registrar venta</button></div>
+  <p class="muted">Solo se listan productos con stock. Al registrar, se guarda la venta y su detalle y se descuenta el inventario.</p>
+</form>
+<script>
+const P = <?= json_encode($prods, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = n => '$' + Math.round(n).toLocaleString('es-CO'), body = document.getElementById('lines');
+function calc() { let t = 0; body.querySelectorAll('tr').forEach(r => { const s = (+r.querySelector('[name="cant[]"]').value || 0) * (+r.querySelector('[name="precio[]"]').value || 0); r.querySelector('.sub').textContent = fmt(s); t += s; }); document.getElementById('gt').textContent = fmt(t); }
+function addRow() {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td><select name="cod[]" required><option value="">Elegir producto…</option>${P.map(p => `<option value="${esc(p.c)}" data-p="${p.p}" data-s="${p.s}">${esc(p.c)} · ${esc(p.n)} (stock ${p.s})</option>`).join('')}</select></td>
+  <td><input type="number" name="cant[]" min="1" value="1" required></td><td><input type="number" name="precio[]" min="0" step="any" required></td><td class="sub num">$0</td><td><button type="button" class="del x">✕</button></td>`;
+  body.appendChild(tr);
+}
+body.addEventListener('change', e => { if (e.target.name === 'cod[]') { const o = e.target.selectedOptions[0], r = e.target.closest('tr'); r.querySelector('[name="precio[]"]').value = o.dataset.p || ''; r.querySelector('[name="cant[]"]').max = o.dataset.s || ''; } calc(); });
+body.addEventListener('input', calc);
+body.addEventListener('click', e => { if (e.target.classList.contains('x') && body.rows.length > 1) { e.target.closest('tr').remove(); calc(); } });
+document.getElementById('add').onclick = addRow; addRow();
+</script>
+<?php include __DIR__ . '/includes/bottom.php';
+
+
+############################################################
+# ARCHIVO: admin/nueva_entrada.php
+# Registro de entradas de mercancía con suma de stock
+############################################################
+<?php
+require __DIR__ . '/includes/boot.php';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    check_csrf();
+    try {
+        $c = $_POST['codigo'] ?? ''; $q = (int)($_POST['cantidad'] ?? 0); $cost = (float)($_POST['costo'] ?? 0);
+        if ($c === '' || $q <= 0) throw new Exception('Elige un producto y una cantidad mayor a 0.');
+        $pdo->beginTransaction();
+        $s = $pdo->prepare("SELECT categoria FROM productos WHERE codigo_producto=? FOR UPDATE"); $s->execute([$c]); $cat = $s->fetchColumn();
+        if ($cat === false) throw new Exception('El producto no existe.');
+        $pdo->prepare("INSERT INTO entradas (id_entrada, codigo_producto, fecha, categoria, costo_unitario, cantidad, id_proveedor, total) VALUES (?,?,?,?,?,?,?,?)")
+            ->execute([next_id($pdo, 'entradas', 'id_entrada'), $c, $_POST['fecha'] ?: date('Y-m-d'), $cat, $cost, $q, ($_POST['prov'] ?? '') ?: null, $q * $cost]);
+        $pdo->prepare("UPDATE productos SET stock_actual = stock_actual + ?, costo_unitario = ? WHERE codigo_producto=?")->execute([$q, $cost, $c]);
+        $pdo->commit(); flash("Entrada registrada: +$q unidades. Inversión: " . cop($q * $cost) . '.'); header('Location: nueva_entrada.php'); exit;
+    } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); flash($e->getMessage(), 'err'); header('Location: nueva_entrada.php'); exit; }
+}
+$prods = $pdo->query("SELECT codigo_producto, nombre, stock_actual, costo_unitario FROM productos ORDER BY nombre")->fetchAll();
+$prov = $pdo->query("SELECT id_proveedor, empresa FROM proveedores ORDER BY empresa")->fetchAll();
+$titulo = 'Registrar entrada de mercancía'; $activo = 'ne'; include __DIR__ . '/includes/top.php';
+?>
+<form class="panel form" method="post"><?= csrf_field() ?><div class="fgrid">
+  <label>Producto<select name="codigo" id="prod" required><option value="">Elegir…</option>
+    <?php foreach ($prods as $p) echo '<option value="' . h($p['codigo_producto']) . '" data-c="' . h($p['costo_unitario']) . '">' . h($p['codigo_producto']) . ' · ' . h($p['nombre']) . ' (stock ' . (int)$p['stock_actual'] . ')</option>'; ?></select></label>
+  <label>Proveedor<select name="prov"><option value="">— sin proveedor —</option><?php foreach ($prov as $p) echo '<option value="' . h($p['id_proveedor']) . '">' . h($p['empresa']) . '</option>'; ?></select></label>
+  <label>Fecha<input type="date" name="fecha" value="<?= date('Y-m-d') ?>" required></label>
+  <label>Cantidad<input type="number" name="cantidad" id="q" min="1" value="1" required></label>
+  <label>Costo unitario (COP)<input type="number" name="costo" id="c" min="0" step="any" required></label>
+  <label>Total<input id="t" readonly></label></div>
+  <div class="acts"><button class="btn">Registrar entrada</button></div>
+  <p class="muted">Suma las unidades al stock del producto y actualiza su costo unitario. ¿Es un producto nuevo? Créalo primero en <a href="tabla.php?t=productos&m=form">Productos</a>.</p></form>
+<script>
+const $ = i => document.getElementById(i), upd = () => $('t').value = '$' + Math.round((+$('q').value || 0) * (+$('c').value || 0)).toLocaleString('es-CO');
+$('prod').onchange = e => { $('c').value = e.target.selectedOptions[0].dataset.c || ''; upd(); }; $('q').oninput = $('c').oninput = upd;
+</script>
+<?php include __DIR__ . '/includes/bottom.php';
+
+
+############################################################
+# ARCHIVO: assets/css/style.css
+# Estilos de la tienda (paleta del logo)
+############################################################
+:root{--bg:#0b0c0f;--card:#14151a;--line:#2b2d35;--tx:#f2f3f5;--mu:#9a9ea9;--ac:#d9202b;--ac-tx:#ff5a63;--ac2:#c9ccd3;--r:14px}
+@media (prefers-color-scheme:light){:root{--bg:#f3f4f6;--card:#fff;--line:#e1e3e8;--tx:#16171b;--mu:#6b6d78;--ac-tx:#c4121e}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.5 Inter,system-ui,sans-serif}
+a{color:inherit;text-decoration:none}.wrap{max-width:1180px;margin:0 auto;padding:0 20px}
+h1,h2,h3,.logo{font-family:'Barlow Condensed',sans-serif;letter-spacing:.01em}
+.muted,.mu{color:var(--mu)}code{font-size:.78rem;color:var(--mu);background:var(--bg);padding:2px 7px;border-radius:6px;border:1px solid var(--line)}
+.nav{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.nav-in{display:flex;align-items:center;gap:16px;height:68px}
+.logo{font-size:2rem;font-weight:800;color:var(--tx);font-style:italic;text-transform:uppercase}.logo b{color:var(--ac);font-weight:800;text-shadow:0 0 18px rgba(217,32,43,.45)}
+.search{flex:1;display:flex;max-width:520px;margin:0 auto;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:var(--card)}
+.search input{flex:1;border:0;background:none;color:var(--tx);padding:10px 16px;font:inherit;outline:0;min-width:0}
+.search button{border:0;background:var(--ac);color:#fff;padding:0 18px;font-weight:600;cursor:pointer}
+.btn{display:inline-block;padding:10px 18px;border-radius:999px;background:var(--ac);color:#fff;font-weight:600;transition:.2s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 8px 20px -6px var(--ac)}
+.btn.wa{background:#1fa855}.btn.ghost{background:none;border:1px solid var(--line);color:var(--tx)}.big-btn{padding:14px 26px;font-size:1.05rem;margin-right:8px}
+.hero{padding:64px 0 48px;background:radial-gradient(800px 300px at 80% 0,rgba(217,32,43,.25),transparent),repeating-linear-gradient(115deg,transparent 0 22px,rgba(255,255,255,.025) 22px 44px);border-bottom:1px solid var(--line)}
+.eyebrow{color:var(--ac-tx);font-weight:600;letter-spacing:.2em;text-transform:uppercase;font-size:.8rem;margin:0}
+.hero h1{font-size:clamp(2.4rem,6vw,4.4rem);line-height:1;margin:.3em 0;max-width:780px;font-weight:800;text-transform:uppercase}
+.hero em{font-style:normal;background:linear-gradient(90deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{color:var(--mu);max-width:560px;font-size:1.1rem}
+.stats{display:flex;gap:32px;margin-top:26px;color:var(--mu);font-size:.9rem;flex-wrap:wrap}.stats b{display:block;font:800 2rem 'Barlow Condensed';color:var(--tx)}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:26px 0 8px;scrollbar-width:thin}
+.chips a{white-space:nowrap;padding:8px 16px;border:1px solid var(--line);border-radius:999px;background:var(--card);font-size:.92rem;transition:.2s}
+.chips a small{color:var(--mu);margin-left:4px}.chips a:hover{border-color:var(--ac)}.chips a.on{background:var(--ac);border-color:var(--ac);color:#fff}.chips a.on small{color:#fff}
+.bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0 18px;flex-wrap:wrap}.bar p{margin:0;color:var(--mu)}.bar b{color:var(--tx)}
+select{background:var(--card);color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font:inherit}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;transition:.25s}
+.card:hover{transform:translateY(-6px);border-color:var(--ac);box-shadow:0 18px 40px -18px rgba(217,32,43,.45)}
+.thumb{position:relative;height:160px;display:grid;place-items:center;background:linear-gradient(135deg,#1b1c21,#a3101a 170%)}
+.thumb span{font-size:3.6rem;filter:drop-shadow(0 6px 10px rgba(0,0,0,.4));transition:.25s}.card:hover .thumb span{transform:scale(1.15) rotate(-6deg)}
+.thumb.big{height:380px;border-radius:var(--r)}.thumb.big span{font-size:8rem}
+.badge{font-style:normal;font-size:.72rem;font-weight:600;padding:4px 10px;border-radius:999px;display:inline-block}
+.thumb .badge{position:absolute;top:12px;left:12px}
+.badge.ok{background:#16351f;color:#5be08a}.badge.low{background:#3a2a0c;color:#ffc14d}.badge.out{background:#3a1414;color:#ff7a7a}
+.info{padding:16px;display:flex;flex-direction:column;gap:6px;flex:1}.cat{color:var(--ac-tx);text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;font-weight:600}
+.info h3{margin:0;font-size:1.3rem;line-height:1.15;font-weight:700;flex:1}
+.row{display:flex;justify-content:space-between;align-items:center;margin-top:8px}.row strong{font-size:1.2rem}
+.pager{display:flex;justify-content:center;gap:6px;flex-wrap:wrap;margin:36px 0}
+.pager a{min-width:40px;height:40px;display:grid;place-items:center;border:1px solid var(--line);border-radius:10px;background:var(--card)}.pager a.on,.pager a:hover{background:var(--ac);border-color:var(--ac);color:#fff}
+.alert{margin:40px 0;padding:22px;border:1px solid #6b2b2b;background:#2a1414;color:#ffb3b3;border-radius:var(--r)}
+.empty{text-align:center;padding:70px 0;color:var(--mu)}.empty a,.crumbs a{color:var(--ac-tx)}
+.crumbs{margin:26px 0;color:var(--mu);font-size:.9rem}
+.detail{display:grid;grid-template-columns:1fr 1fr;gap:40px;align-items:start}
+.detail h1{font-size:clamp(2rem,4vw,3rem);line-height:1.05;margin:.2em 0;text-transform:uppercase}
+.price{font:800 2.6rem 'Barlow Condensed';color:var(--ac-tx);margin:.1em 0}
+.facts{list-style:none;padding:0;margin:22px 0;border-top:1px solid var(--line)}.facts li{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--line)}.facts span{color:var(--mu)}
+.sec{font-size:2rem;margin:56px 0 18px;text-transform:uppercase}
+.foot{margin-top:70px;padding:30px 0;border-top:1px solid var(--line);text-align:center;color:var(--mu);font-size:.9rem}.foot strong{color:var(--tx)}
+@media(max-width:760px){.nav-in{flex-wrap:wrap;height:auto;padding:10px 20px}.search{order:3;flex-basis:100%;max-width:none}.detail{grid-template-columns:1fr}.thumb.big{height:240px}.hero{padding:40px 0 30px}}
+/* ---- disponibilidad, filtro, footer ---- */
+.bar form{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.chk{display:flex;gap:8px;align-items:center;color:var(--mu);cursor:pointer;font-size:.92rem}.chk input{accent-color:var(--ac);width:16px;height:16px}
+.stk{font-size:.8rem;font-weight:600}.stk.ok{color:#3fcf72}.stk.low{color:#ffb347}.stk.out{color:#ff7a7a}
+.meter{height:8px;border-radius:99px;background:var(--line);overflow:hidden;margin:-4px 0 14px;max-width:320px}.meter i{display:block;height:100%;border-radius:99px;background:#3fcf72}.meter i.low{background:#ffb347}.meter i.out{background:#ff7a7a}
+.foot{text-align:left}.foot-grid{display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:30px}.foot h4{margin:0 0 10px;color:var(--tx);font:700 1.2rem 'Barlow Condensed';text-transform:uppercase;letter-spacing:.05em}.foot p{margin:4px 0}.foot .logo{font-size:1.8rem}
+.social{display:flex;flex-wrap:wrap;gap:8px}.social a{padding:7px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);transition:.2s;font-size:.9rem;color:var(--tx)}.social a:hover{background:var(--ac);border-color:var(--ac);color:#fff}
+.copy{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);text-align:center}.copy a{color:var(--ac-tx)}
+@media(max-width:760px){.foot-grid{grid-template-columns:1fr}}
+
+/* ---- identidad del logo ---- */
+.hero-in{display:grid;grid-template-columns:1.2fr .8fr;gap:40px;align-items:center}
+.hero-logo{width:100%;max-width:440px;justify-self:center;border-radius:22px;border:1px solid var(--line);box-shadow:0 0 70px -12px rgba(217,32,43,.6)}
+.hero{background:radial-gradient(800px 320px at 85% 0,rgba(217,32,43,.28),transparent),repeating-linear-gradient(135deg,transparent 0 6px,rgba(255,255,255,.018) 6px 12px)}
+.btn{background:linear-gradient(180deg,#e5242f,#b5121c)}
+.chips a.on{background:linear-gradient(180deg,#e5242f,#b5121c)}
+.card:hover{box-shadow:0 18px 40px -18px rgba(217,32,43,.55)}
+@media(max-width:760px){.hero-in{grid-template-columns:1fr}.hero-logo{max-width:300px;order:-1}}
+/* ---- fotos de productos ---- */
+.thumb{overflow:hidden}.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transition:transform .35s}.card:hover .thumb img{transform:scale(1.07)}.thumb .badge{z-index:1}
+
+
+############################################################
+# ARCHIVO: assets/css/admin.css
+# Estilos del panel de administrador
+############################################################
+body.adm{display:grid;grid-template-columns:250px 1fr;min-height:100vh}
+.side{background:var(--card);border-right:1px solid var(--line);padding:22px 14px;position:sticky;top:0;height:100vh;overflow-y:auto}
+.side .logo{display:block;font-size:1.7rem;padding:0 10px 16px}.side .logo small{font:600 .7rem Inter;color:var(--mu);letter-spacing:.15em}
+.side nav a{display:block;padding:9px 12px;border-radius:10px;color:var(--mu);font-size:.92rem;transition:.15s}.side nav a:hover{background:var(--bg);color:var(--tx)}.side nav a.on{background:var(--ac);color:#fff}
+.side nav p{margin:16px 12px 6px;font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;color:var(--mu)}
+.mainc{padding:26px 30px 50px;min-width:0}.topb h1{margin:0 0 20px;font-size:2.3rem;text-transform:uppercase}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:20px;margin-bottom:20px}.panel h2{margin:0 0 14px;font-size:1.4rem;text-transform:uppercase;display:flex;justify-content:space-between;align-items:baseline}
+.more{font:500 .8rem Inter;color:var(--ac-tx);text-transform:none}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px}.kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:18px;border-top:3px solid var(--ac)}
+.kpi.good{border-top-color:#3fcf72}.kpi.bad{border-top-color:#ffb347}.kpi small{color:var(--mu);display:block}.kpi b{display:block;font:800 1.9rem 'Barlow Condensed';margin:2px 0}.kpi span{color:var(--mu);font-size:.78rem}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:20px}.cols .panel{margin:0}.cols{margin-bottom:20px}
+.hbar{display:grid;grid-template-columns:90px 1fr auto;gap:10px;align-items:center;margin:9px 0;font-size:.85rem}.hbar div{height:10px;background:var(--line);border-radius:99px;overflow:hidden}.hbar i{display:block;height:100%;background:linear-gradient(90deg,var(--ac),var(--ac2));border-radius:99px}
+.tw{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.88rem}th{text-align:left;color:var(--mu);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.06em;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--ac) 6%,transparent)}.num{text-align:right;white-space:nowrap}.pos{color:#3fcf72}.neg{color:#ff7a7a}
+.ra{white-space:nowrap;text-align:right}.ra form{display:inline}.ra a{color:var(--ac-tx);margin-right:12px}.del{background:none;border:0;color:#ff7a7a;cursor:pointer;font:inherit}
+.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap}.toolbar form{display:flex;gap:8px}.toolbar .btn:last-child{margin-left:auto}.filt .btn:last-child{margin-left:0}.filt label{color:var(--mu);font-size:.85rem;display:flex;gap:6px;align-items:center}
+input,select{background:var(--bg);color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font:inherit;min-width:0}input:focus,select:focus{outline:2px solid var(--ac);outline-offset:-1px}input[readonly]{opacity:.6}
+button.btn{border:0;cursor:pointer;font:inherit;font-weight:600}button.btn.ghost{border:1px solid var(--line)}
+.form h2{margin:0 0 16px}.fgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px;margin-bottom:18px}.fgrid label,.login label{display:flex;flex-direction:column;gap:6px;font-size:.82rem;color:var(--mu)}
+.acts{display:flex;gap:12px;align-items:center;margin:16px 0 6px;flex-wrap:wrap}.gt{margin-left:auto;font-size:1.1rem}.gt b{color:var(--ac-tx);font-size:1.4rem}
+.lines td{padding:6px}.lines select{width:100%;min-width:260px}.lines input{width:110px}.x{font-size:1rem}
+.flash{padding:13px 18px;border-radius:12px;margin-bottom:18px;font-weight:500}.flash.ok{background:#16351f;color:#5be08a;border:1px solid #245c35}.flash.err{background:#2a1414;color:#ffb3b3;border:1px solid #6b2b2b}
+body.login{display:grid;place-items:center;min-height:100vh;background:radial-gradient(700px 300px at 70% 0,rgba(217,32,43,.25),transparent),var(--bg)}
+.lbox{width:min(380px,92vw);background:var(--card);border:1px solid var(--line);border-radius:18px;padding:32px;display:flex;flex-direction:column;gap:14px}.lbox .logo{font-size:2.4rem;text-align:center}.lbox p{text-align:center;margin:0}.lbox a{text-align:center;font-size:.85rem}
+@media(max-width:900px){body.adm{grid-template-columns:1fr}.side{position:static;height:auto}.side nav{display:flex;flex-wrap:wrap;gap:4px}.side nav p{display:none}.cols{grid-template-columns:1fr}.mainc{padding:20px 14px}}
+/* ---- fotos de productos ---- */
+.mini{width:46px;height:46px;object-fit:cover;border-radius:8px;border:1px solid var(--line);display:block}.mini.big{width:96px;height:96px;border-radius:12px}.mini.ph{display:grid;place-items:center;font-size:1.8rem;background:var(--bg)}
+.fotobox{display:flex;gap:16px;align-items:center;margin:4px 0 14px;padding:14px;border:1px dashed var(--line);border-radius:12px}.fotobox label{display:flex;flex-direction:column;gap:6px;font-size:.82rem;color:var(--mu)}
+
+
